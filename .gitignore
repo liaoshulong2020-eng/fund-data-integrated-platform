@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Runtime data
+fund_data/
+fund_excel/
+fund_cache/
+fund_visual_reports/
+target_funds.json
+my_portfolio.json
+watchlist_funds.json
+
+# Runtime folders in this clean repo layout
+data/*
+outputs/*
+cache/*
+!data/README.md
+!outputs/README.md
+!cache/README.md
+
+# Generated lists
+所有基金代码_*.txt
+所有基金列表_*.txt
+所有基金列表_*.csv
+
+# Logs and temporary files
+*.log
+request.log
+*.tmp
+check_output.txt
+peek_output.txt
+
+# Local-only reference material
+参考/
+open_source_release/
+test_git_init_direct/
+github_release/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
