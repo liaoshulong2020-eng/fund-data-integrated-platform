@@ -2,6 +2,7 @@
 # Auto-generated unified system script
 import os
 import sys
+import glob
 import threading
 import webbrowser
 from flask import Flask, jsonify, request
@@ -427,6 +428,13 @@ def _install_integrated_result_viewer():
         win.geometry("1280x820")
         win.minsize(980, 640)
         win.configure(bg="#0f172a")
+        try:
+            win.transient(self.root)
+            win.lift()
+            win.focus_force()
+            win.after(120, win.lift)
+        except Exception:
+            pass
 
         header = tk.Frame(win, bg="#0f172a")
         header.pack(fill="x", padx=14, pady=(12, 8))
@@ -1143,8 +1151,73 @@ def _install_native_tonghuashun_viewer():
                     return col
         return fallback
 
+    def _viewer_profile(title_hint, columns):
+        text = str(title_hint).lower()
+        col_text = " ".join(str(c) for c in columns)
+
+        def has(*words):
+            source = text + " " + col_text
+            return any(str(word).lower() in source for word in words)
+
+        common = ["基金代码", "基金名称", "最新净值", "今日涨幅", "近1月", "近3月", "近6月", "近1年", "基金类型", "基金经理"]
+        profiles = [
+            (has("风险回撤", "风险决策", "回撤", "drawdown", "risk"),
+             "风险回撤", "夏普比率",
+             ["夏普比率", "最大回撤", "当前回撤", "回撤进度", "年化收益", "波动率", "下行波动", "决策建议", "卡玛比率", "索提诺比率"]),
+            (has("风险效率", "efficiency", "sharpe", "calmar", "sortino"),
+             "风险效率", "风险效率评分",
+             ["风险效率评分", "Sharpe估算", "Calmar估算", "Sortino估算", "年化收益", "最大回撤估算", "成立年限", "规模"]),
+            (has("位置估值", "位置", "估值", "position"),
+             "位置估值", "位置得分",
+             ["位置得分", "估值位置", "当前分位", "近1年分位", "最大回撤", "当前回撤", "最新净值", "规模"]),
+            (has("趋势择时", "趋势", "timing"),
+             "趋势择时", "趋势得分",
+             ["趋势得分", "趋势状态", "均线状态", "动量", "近1月", "近3月", "近6月", "当前回撤"]),
+            (has("基金经理", "经理", "manager"),
+             "基金经理", "经理得分",
+             ["经理得分", "基金经理", "任职年限", "管理规模", "代表基金", "近1年", "近3年", "最大回撤"]),
+            (has("交易成本", "成本", "cost", "费率"),
+             "交易成本", "成本得分",
+             ["成本得分", "申购费率", "管理费率", "托管费率", "销售服务费", "买入状态", "申购状态分", "规模"]),
+            (has("收益归因", "归因", "attribution"),
+             "收益归因", "归因评分",
+             ["归因评分", "主要收益来源", "近1月", "近3月", "近6月", "近1年", "行业主题", "标签"]),
+            (has("长期综合", "综合", "composite"),
+             "长期综合", "综合得分",
+             ["综合得分", "收益表现评分", "风险效率评分", "位置得分", "趋势得分", "经理得分", "成本得分", "近1年", "最大回撤"]),
+            (has("回撤震荡", "震荡"),
+             "回撤震荡", "回撤震荡评分",
+             ["回撤震荡评分", "当前回撤", "最大回撤", "回撤进度", "波动率", "夏普比率", "决策建议", "近1月"]),
+            (has("趋势突破", "突破"),
+             "趋势突破", "趋势突破评分",
+             ["趋势突破评分", "趋势状态", "突破信号", "近1月", "近3月", "近6月", "今日涨幅", "当前回撤"]),
+            (has("低波稳健", "低波", "稳健"),
+             "低波稳健", "低波稳健评分",
+             ["低波稳健评分", "波动率", "最大回撤", "夏普比率", "近1年", "近3年", "规模", "基金经理"]),
+            (has("超跌反弹", "超跌", "反弹"),
+             "超跌反弹", "超跌反弹评分",
+             ["超跌反弹评分", "当前回撤", "最大回撤", "回撤进度", "近1月", "近3月", "今日涨幅", "决策建议"]),
+            (has("收益表现", "performance"),
+             "收益表现", "收益表现评分",
+             ["收益表现评分", "近1月", "近3月", "近6月", "近1年", "近3年", "成立以来", "成立年限"]),
+        ]
+        for matched, name, primary, cols in profiles:
+            if matched:
+                return {"name": name, "primary": primary, "priority": ["基金代码", "基金名称"] + cols + common}
+        return {"name": "通用结果", "primary": "综合得分", "priority": ["基金代码", "基金名称", "专题评分", "综合得分"] + common}
+
+    _SHEET_CACHE = {}
+    _FUND_MAP_CACHE = {"key": None, "value": {}}
+
     def _prepare_sheets(path):
         import pandas as pd
+
+        cache_key = (os.path.abspath(path), os.path.getmtime(path), os.path.getsize(path))
+        cached = _SHEET_CACHE.get(cache_key)
+        if cached:
+            return cached
+        if len(_SHEET_CACHE) >= 3:
+            _SHEET_CACHE.clear()
 
         raw = pd.read_excel(path, sheet_name=None)
         sheets = []
@@ -1155,13 +1228,14 @@ def _install_native_tonghuashun_viewer():
         for sheet_name, df in raw.items():
             df = df.fillna("")
             columns = [str(c) for c in df.columns]
+            profile = _viewer_profile(os.path.basename(path) + " " + str(sheet_name), columns)
             fallback = columns[0] if columns else ""
             name_col = _pick_col(columns, ["基金名称", "基金简称", "名称", "fund_name"], fallback)
             code_col = _pick_col(columns, ["基金代码", "代码", "fund_code"], "")
             type_col = _pick_col(columns, ["基金类型", "类型"], "")
             score_col = _pick_col(
                 columns,
-                ["专题评分", "综合得分", "收益表现评分", "风险得分", "效率得分", "位置得分", "趋势得分", "经理得分", "成本得分", "评分", "得分", "score"],
+                [profile["primary"], "专题评分", "综合得分", "收益表现评分", "风险效率评分", "风险得分", "效率得分", "位置得分", "趋势得分", "经理得分", "成本得分", "评分", "得分", "score"],
                 "",
             )
             if not score_col:
@@ -1191,12 +1265,7 @@ def _install_native_tonghuashun_viewer():
             rows.sort(key=lambda r: (r["_score"] is not None, r["_score"] if r["_score"] is not None else -10**9), reverse=True)
             if "今日涨幅" not in columns and ("日增长率" in columns or "日涨跌幅" in columns):
                 columns.append("今日涨幅")
-            front_cols = [
-                "基金代码", "基金名称", "专题评分", "收益表现评分", "综合得分",
-                "最新净值", "今日涨幅", "近1月", "近3月", "近6月",
-                "近1年", "近3年", "近5年", "成立以来", "最大回撤", "夏普比率",
-                "年化收益", "申购状态分", "买入状态", "申购费率", "规模", "规模(亿)",
-            ]
+            front_cols = profile["priority"]
             back_cols = ["基金类型", "标签", "基金经理", "成立日期", "净值日期"]
             ordered = []
             for col in front_cols:
@@ -1221,6 +1290,7 @@ def _install_native_tonghuashun_viewer():
                 "code_col": code_col,
                 "type_col": type_col,
                 "score_col": score_col,
+                "profile": profile,
             })
 
         summary = {
@@ -1231,7 +1301,9 @@ def _install_native_tonghuashun_viewer():
             "min_score": min(all_scores) if all_scores else None,
             "top_types": sorted(type_counts.items(), key=lambda item: item[1], reverse=True)[:8],
         }
-        return sheets, summary
+        result = (sheets, summary)
+        _SHEET_CACHE[cache_key] = result
+        return result
 
     def _latest_fund_map():
         import glob
@@ -1239,21 +1311,62 @@ def _install_native_tonghuashun_viewer():
 
         files = glob.glob(os.path.join(SCRIPT_DIR, "fund_data", "fund_profile_*.json"))
         files += glob.glob(os.path.join("fund_data", "fund_profile_*.json"))
-        files = sorted(set(files), key=os.path.getmtime, reverse=True)
-        if not files:
+        files = [
+            path for path in sorted(set(files), key=os.path.getmtime, reverse=True)
+            if not path.endswith(".tmp") and os.path.getsize(path) > 1024
+        ]
+        cache_key = tuple((os.path.abspath(path), os.path.getmtime(path), os.path.getsize(path)) for path in files[:3])
+        if _FUND_MAP_CACHE.get("key") == cache_key:
+            return _FUND_MAP_CACHE.get("value", {})
+
+        data = []
+        for path in files:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                rows = loaded if isinstance(loaded, list) else loaded.get("results", [])
+                if rows:
+                    data = rows
+                    break
+            except Exception:
+                continue
+        if not data:
             return {}
-        try:
-            with open(files[0], "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return {}
-        results = data if isinstance(data, list) else data.get("results", [])
         mapping = {}
-        for item in results:
+        for item in data:
             code = str(item.get("fund_code", "")).zfill(6)
             if code and code not in mapping:
                 mapping[code] = item
+        _FUND_MAP_CACHE["key"] = cache_key
+        _FUND_MAP_CACHE["value"] = mapping
         return mapping
+
+    class _LazyFundMap:
+        def __init__(self):
+            self._loaded = False
+            self._loading = False
+            self._data = {}
+            self._lock = threading.Lock()
+
+        def preload(self):
+            self._ensure_loaded()
+
+        def _ensure_loaded(self):
+            if self._loaded:
+                return
+            with self._lock:
+                if self._loaded:
+                    return
+                self._loading = True
+                try:
+                    self._data = _latest_fund_map()
+                finally:
+                    self._loaded = True
+                    self._loading = False
+
+        def get(self, code, default=None):
+            self._ensure_loaded()
+            return self._data.get(str(code).zfill(6), default)
 
     def _fund_code_from_row(row, sheet):
         code = row.get("_code") or row.get(sheet.get("code_col", ""))
@@ -1327,6 +1440,289 @@ def _install_native_tonghuashun_viewer():
             canvas.create_text(legend_x + 24, height - 22, text=str(series["name"])[:14], fill=COLORS["text"], anchor="w", font=("Microsoft YaHei", 9))
             legend_x += 145
 
+    def _history_points(nav_history):
+        from datetime import datetime as _datetime
+        points = []
+        for row in nav_history or []:
+            try:
+                date_text = str(row.get("date", ""))[:10]
+                date_obj = _datetime.strptime(date_text, "%Y-%m-%d").date()
+                value = float(row.get("val"))
+                if value > 0:
+                    points.append((date_obj, date_text, value))
+            except Exception:
+                continue
+        points.sort(key=lambda item: item[0])
+        return points
+
+    def _filter_history_period(points, period):
+        from datetime import timedelta as _timedelta
+        if not points:
+            return []
+        if period == "all":
+            return points
+        last_day = points[-1][0]
+        if period == "ytd":
+            cutoff = last_day.replace(month=1, day=1)
+        else:
+            days = {"1m": 31, "3m": 92, "6m": 183, "1y": 365, "3y": 365 * 3, "5y": 365 * 5}.get(period)
+            cutoff = last_day if not days else last_day - _timedelta(days=days)
+        filtered = [item for item in points if item[0] >= cutoff]
+        return filtered if len(filtered) >= 2 else points[-min(len(points), 30):]
+
+    def _draw_single_nav_chart(canvas, nav_history, period):
+        from datetime import date as _date
+        canvas.delete("all")
+        canvas.update_idletasks()
+        points = _filter_history_period(_history_points(nav_history), period)
+        width = max(canvas.winfo_width(), 760)
+        height = max(canvas.winfo_height(), 320)
+        pad_l, pad_t, pad_r, pad_b = 66, 78, 26, 46
+        chart_w = width - pad_l - pad_r
+        chart_h = height - pad_t - pad_b
+        if len(points) < 2:
+            canvas.create_text(40, 70, text="暂无净值走势数据", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 12))
+            return
+
+        values = [item[2] for item in points]
+        min_v, max_v = min(values), max(values)
+        pad = max((max_v - min_v) * 0.08, max_v * 0.01)
+        min_v -= pad
+        max_v += pad
+        span = max(max_v - min_v, 1e-9)
+
+        peak_val = points[0][2]
+        peak_idx = 0
+        max_dd = 0.0
+        max_peak_idx = 0
+        max_trough_idx = 0
+        current_peak = points[0][2]
+        for idx, (_date_obj, _date_text, value) in enumerate(points):
+            if value > peak_val:
+                peak_val = value
+                peak_idx = idx
+            dd = value / peak_val - 1.0 if peak_val else 0.0
+            if dd < max_dd:
+                max_dd = dd
+                max_peak_idx = peak_idx
+                max_trough_idx = idx
+            current_peak = max(current_peak, value)
+
+        repair_idx = None
+        repair_target = points[max_peak_idx][2]
+        for idx in range(max_trough_idx + 1, len(points)):
+            if points[idx][2] >= repair_target:
+                repair_idx = idx
+                break
+        current_dd = points[-1][2] / current_peak - 1.0 if current_peak else 0.0
+        progress = abs(current_dd) / abs(max_dd) * 100 if max_dd < 0 else 0.0
+        progress = max(0.0, min(progress, 100.0))
+        fall_days = (points[max_trough_idx][0] - points[max_peak_idx][0]).days
+        if repair_idx is not None:
+            repair_days = (points[repair_idx][0] - points[max_trough_idx][0]).days
+            repair_text = f"已修复 {repair_days}天"
+        else:
+            repair_days = (_date.today() - points[max_trough_idx][0]).days
+            repair_text = f"未修复 {repair_days}天"
+
+        chips = [
+            ("最大回撤", f"{max_dd * 100:.2f}%"),
+            ("回撤进度", f"{progress:.1f}%"),
+            ("当前回撤", f"{current_dd * 100:.2f}%"),
+            ("修复状态", repair_text),
+        ]
+        chip_x = pad_l
+        for label, value in chips:
+            chip_w = 132 if label != "修复状态" else 154
+            canvas.create_rectangle(chip_x, 16, chip_x + chip_w, 58, fill=COLORS["panel2"], outline=COLORS["line"])
+            canvas.create_text(chip_x + 10, 28, text=label, fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 8))
+            chip_color = COLORS["green"] if "回撤" in label or "进度" in label else COLORS["text"]
+            canvas.create_text(chip_x + 10, 47, text=value, fill=chip_color, anchor="w", font=("Microsoft YaHei", 10, "bold"))
+            chip_x += chip_w + 8
+
+        for i in range(6):
+            y = pad_t + chart_h * i / 5
+            value = max_v - span * i / 5
+            canvas.create_line(pad_l, y, width - pad_r, y, fill=COLORS["line"])
+            canvas.create_text(10, y, text=f"{value:.4f}", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 9))
+
+        coords = []
+        xy = []
+        for idx, (_date_obj, _date_text, value) in enumerate(points):
+            x = pad_l + chart_w * idx / max(len(points) - 1, 1)
+            y = pad_t + chart_h - (value - min_v) / span * chart_h
+            coords.extend([x, y])
+            xy.append((x, y))
+        if len(coords) >= 4:
+            px, _py = xy[max_peak_idx]
+            tx, ty = xy[max_trough_idx]
+            canvas.create_rectangle(px, pad_t, tx, pad_t + chart_h, fill="#1f2737", outline="")
+            fill_poly = [pad_l, pad_t + chart_h] + coords + [width - pad_r, pad_t + chart_h]
+            canvas.create_polygon(*fill_poly, fill="#2b1720", outline="")
+            canvas.create_line(*coords, fill=COLORS["red"], width=2)
+            canvas.create_line(px, pad_t, px, pad_t + chart_h, fill=COLORS["gold"], dash=(4, 3))
+            canvas.create_line(tx, pad_t, tx, pad_t + chart_h, fill=COLORS["green"], dash=(4, 3))
+            canvas.create_oval(px - 4, xy[max_peak_idx][1] - 4, px + 4, xy[max_peak_idx][1] + 4, fill=COLORS["gold"], outline="")
+            canvas.create_oval(tx - 4, ty - 4, tx + 4, ty + 4, fill=COLORS["green"], outline="")
+            canvas.create_text(px + 8, xy[max_peak_idx][1] - 14, text="回撤起点", fill=COLORS["gold"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
+            canvas.create_text(tx + 8, ty + 16, text=f"最大回撤 {max_dd * 100:.2f}% | 下跌{fall_days}天", fill=COLORS["green"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
+            if repair_idx is not None and repair_idx < len(xy):
+                rx, ry = xy[repair_idx]
+                canvas.create_line(rx, pad_t, rx, pad_t + chart_h, fill=COLORS["blue"], dash=(4, 3))
+                canvas.create_oval(rx - 4, ry - 4, rx + 4, ry + 4, fill=COLORS["blue"], outline="")
+                canvas.create_text(rx + 8, ry - 14, text="修复完成", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
+            lx, ly = coords[-2], coords[-1]
+            canvas.create_oval(lx - 4, ly - 4, lx + 4, ly + 4, fill=COLORS["red"], outline="")
+            canvas.create_text(lx - 8, ly - 14, text=f"{points[-1][2]:.4f}", fill=COLORS["red"], anchor="e", font=("Microsoft YaHei", 9, "bold"))
+
+        tick_count = min(6, len(points))
+        step = max(1, (len(points) - 1) // max(tick_count - 1, 1))
+        tick_indexes = list(range(0, len(points), step))
+        if tick_indexes[-1] != len(points) - 1:
+            tick_indexes.append(len(points) - 1)
+        for idx in tick_indexes[:7]:
+            x = pad_l + chart_w * idx / max(len(points) - 1, 1)
+            canvas.create_line(x, pad_t + chart_h, x, pad_t + chart_h + 4, fill=COLORS["line"])
+            canvas.create_text(x, height - 22, text=points[idx][1][5:], fill=COLORS["muted"], font=("Microsoft YaHei", 8))
+
+        def draw_crosshair(event):
+            if not xy:
+                return
+            x = min(max(event.x, pad_l), width - pad_r)
+            idx = int(round((x - pad_l) / max(chart_w, 1) * (len(points) - 1)))
+            idx = max(0, min(idx, len(points) - 1))
+            px, py = xy[idx]
+            date_text = points[idx][1]
+            nav_value = points[idx][2]
+            if idx > 0 and points[idx - 1][2]:
+                pct = (nav_value / points[idx - 1][2] - 1) * 100
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct_text = "--"
+            canvas.delete("crosshair")
+            canvas.create_line(px, pad_t, px, pad_t + chart_h, fill="#d1d5db", dash=(3, 3), width=1, tags="crosshair")
+            canvas.create_line(pad_l, py, width - pad_r, py, fill="#475569", dash=(3, 3), width=1, tags="crosshair")
+            canvas.create_oval(px - 5, py - 5, px + 5, py + 5, fill="#ffffff", outline=COLORS["red"], width=2, tags="crosshair")
+            tip_w, tip_h = 148, 72
+            tip_x = px + 12 if px + 12 + tip_w < width - pad_r else px - tip_w - 12
+            tip_y = py - tip_h - 10 if py - tip_h - 10 > pad_t else py + 14
+            canvas.create_rectangle(tip_x, tip_y, tip_x + tip_w, tip_y + tip_h,
+                                    fill="#0b1220", outline=COLORS["line"], tags="crosshair")
+            canvas.create_text(tip_x + 10, tip_y + 16, text=date_text, fill=COLORS["text"],
+                               anchor="w", font=("Microsoft YaHei", 9, "bold"), tags="crosshair")
+            canvas.create_text(tip_x + 10, tip_y + 38, text=f"净值 {nav_value:.4f}", fill=COLORS["red"],
+                               anchor="w", font=("Microsoft YaHei", 10, "bold"), tags="crosshair")
+            canvas.create_text(tip_x + 10, tip_y + 58, text=f"涨跌 {pct_text}", fill=COLORS["green"] if pct_text.startswith("-") else COLORS["red"],
+                               anchor="w", font=("Microsoft YaHei", 9, "bold"), tags="crosshair")
+
+        canvas.bind("<Motion>", draw_crosshair)
+        canvas.bind("<Button-1>", draw_crosshair)
+        canvas.bind("<B1-Motion>", draw_crosshair)
+
+    def _draw_drawdown_chart(canvas, nav_history):
+        from datetime import date as _date
+        canvas.delete("all")
+        canvas.update_idletasks()
+        points = _history_points(nav_history)
+        width = max(canvas.winfo_width(), 760)
+        height = max(canvas.winfo_height(), 230)
+        pad_l, pad_t, pad_r, pad_b = 66, 28, 26, 42
+        chart_w = width - pad_l - pad_r
+        chart_h = height - pad_t - pad_b
+        if len(points) < 20:
+            canvas.create_text(40, 70, text="历史净值不足，暂无法计算回撤", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 12))
+            return {}
+
+        peak_val = points[0][2]
+        peak_idx = 0
+        max_dd = 0.0
+        max_peak_idx = 0
+        max_trough_idx = 0
+        dd_points = []
+        for idx, (_d, _t, value) in enumerate(points):
+            if value > peak_val:
+                peak_val = value
+                peak_idx = idx
+            dd = value / peak_val - 1.0 if peak_val else 0.0
+            dd_points.append(dd)
+            if dd < max_dd:
+                max_dd = dd
+                max_peak_idx = peak_idx
+                max_trough_idx = idx
+
+        repair_idx = None
+        repair_target = points[max_peak_idx][2]
+        for idx in range(max_trough_idx + 1, len(points)):
+            if points[idx][2] >= repair_target:
+                repair_idx = idx
+                break
+
+        current_peak = max(value for _d, _t, value in points)
+        current_dd = points[-1][2] / current_peak - 1.0 if current_peak else 0.0
+        progress = abs(current_dd) / abs(max_dd) * 100 if max_dd < 0 else 0.0
+        progress = max(0.0, min(progress, 100.0))
+
+        min_dd = min(dd_points)
+        max_dd_axis = 0.0
+        span = max(max_dd_axis - min_dd, 1e-9)
+        for i in range(5):
+            y = pad_t + chart_h * i / 4
+            value = max_dd_axis - span * i / 4
+            canvas.create_line(pad_l, y, width - pad_r, y, fill=COLORS["line"])
+            canvas.create_text(10, y, text=f"{value * 100:.1f}%", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 9))
+
+        coords = []
+        zero_y = pad_t
+        for idx, dd in enumerate(dd_points):
+            x = pad_l + chart_w * idx / max(len(dd_points) - 1, 1)
+            y = pad_t + chart_h - (dd - min_dd) / span * chart_h
+            coords.extend([x, y])
+        if len(coords) >= 4:
+            fill_poly = [pad_l, zero_y] + coords + [width - pad_r, zero_y]
+            canvas.create_polygon(*fill_poly, fill="#17261f", outline="")
+            canvas.create_line(*coords, fill=COLORS["green"], width=2)
+
+        def x_at(idx):
+            return pad_l + chart_w * idx / max(len(dd_points) - 1, 1)
+
+        trough_x = x_at(max_trough_idx)
+        trough_y = pad_t + chart_h - (dd_points[max_trough_idx] - min_dd) / span * chart_h
+        canvas.create_line(x_at(max_peak_idx), pad_t, x_at(max_peak_idx), pad_t + chart_h, fill=COLORS["gold"], dash=(4, 3))
+        canvas.create_line(trough_x, pad_t, trough_x, pad_t + chart_h, fill=COLORS["green"], dash=(4, 3))
+        canvas.create_oval(trough_x - 4, trough_y - 4, trough_x + 4, trough_y + 4, fill=COLORS["green"], outline="")
+        canvas.create_text(trough_x + 8, trough_y - 16, text=f"最大回撤 {max_dd * 100:.2f}%", fill=COLORS["green"], anchor="w", font=("Microsoft YaHei", 9, "bold"))
+        if repair_idx is not None:
+            rx = x_at(repair_idx)
+            canvas.create_line(rx, pad_t, rx, pad_t + chart_h, fill=COLORS["blue"], dash=(4, 3))
+            canvas.create_text(rx + 8, pad_t + 18, text="修复", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei", 9, "bold"))
+
+        tick_indexes = [0, max_trough_idx, len(points) - 1]
+        if repair_idx is not None:
+            tick_indexes.insert(2, repair_idx)
+        seen = set()
+        for idx in tick_indexes:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            x = x_at(idx)
+            canvas.create_text(x, height - 20, text=points[idx][1], fill=COLORS["muted"], font=("Microsoft YaHei", 8))
+
+        max_days = (points[max_trough_idx][0] - points[max_peak_idx][0]).days
+        if repair_idx is not None:
+            repair_days = (points[repair_idx][0] - points[max_trough_idx][0]).days
+            repair_text = f"已修复，用时 {repair_days} 天"
+        else:
+            repair_days = (_date.today() - points[max_trough_idx][0]).days
+            repair_text = f"未修复，已持续 {repair_days} 天"
+        return {
+            "最大回撤": f"{max_dd * 100:.2f}%",
+            "回撤区间": f"{points[max_peak_idx][1]} -> {points[max_trough_idx][1]}",
+            "下跌耗时": f"{max_days} 天",
+            "修复状态": repair_text,
+            "当前回撤": f"{current_dd * 100:.2f}%",
+            "回撤进度": f"{progress:.1f}%",
+        }
+
     def _open_detail_window(parent, row, sheet, fund_map):
         import tkinter as tk
 
@@ -1339,8 +1735,8 @@ def _install_native_tonghuashun_viewer():
 
         win = tk.Toplevel(parent)
         win.title(f"基金详情 - {name}")
-        win.geometry("1040x760")
-        win.minsize(880, 620)
+        win.geometry("1160x900")
+        win.minsize(980, 760)
         win.configure(bg=COLORS["bg"])
 
         header = tk.Frame(win, bg=COLORS["bg"])
@@ -1363,11 +1759,39 @@ def _install_native_tonghuashun_viewer():
             tk.Label(card, text=str(value or "--"), bg=COLORS["panel"], fg=color, font=("Microsoft YaHei", 17, "bold")).pack(anchor="w", padx=14, pady=(0, 8))
 
         chart_panel = tk.Frame(win, bg=COLORS["panel"], highlightbackground=COLORS["line"], highlightthickness=1)
-        chart_panel.pack(fill="both", expand=True, padx=18, pady=(0, 12))
-        tk.Label(chart_panel, text="净值走势", bg=COLORS["panel"], fg=COLORS["text"], font=("Microsoft YaHei", 13, "bold")).pack(anchor="w", padx=14, pady=(12, 0))
-        chart = tk.Canvas(chart_panel, height=360, bg=COLORS["panel"], highlightthickness=0)
-        chart.pack(fill="both", expand=True, padx=12, pady=10)
-        _draw_nav_lines(chart, [{"name": name, "code": code, "history": fund.get("nav_history", [])}], normalized=False)
+        chart_panel.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+        chart_header = tk.Frame(chart_panel, bg=COLORS["panel"])
+        chart_header.pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(chart_header, text="单位净值走势", bg=COLORS["panel"], fg=COLORS["text"], font=("Microsoft YaHei", 13, "bold")).pack(side="left")
+        nav_period = {"value": "1y", "buttons": {}, "redraw_job": None}
+        chart = tk.Canvas(chart_panel, height=520, bg=COLORS["panel"], highlightthickness=0)
+        chart.pack(fill="both", expand=True, padx=12, pady=8)
+
+        def redraw_nav():
+            nav_period["redraw_job"] = None
+            for key, button in nav_period["buttons"].items():
+                active = key == nav_period["value"]
+                button.configure(bg=COLORS["red"] if active else COLORS["panel2"],
+                                 fg="#ffffff" if active else COLORS["text"])
+            _draw_single_nav_chart(chart, fund.get("nav_history", []), nav_period["value"])
+
+        def schedule_redraw(delay=80):
+            job = nav_period.get("redraw_job")
+            if job:
+                try:
+                    win.after_cancel(job)
+                except Exception:
+                    pass
+            nav_period["redraw_job"] = win.after(delay, redraw_nav)
+
+        for key, label in [("1m", "1月"), ("3m", "3月"), ("6m", "6月"), ("1y", "1年"), ("3y", "3年"), ("5y", "5年"), ("ytd", "今年"), ("all", "成立来")]:
+            btn = tk.Button(chart_header, text=label, command=lambda k=key: (nav_period.update({"value": k}), schedule_redraw(10)),
+                            bg=COLORS["panel2"], fg=COLORS["text"], relief="flat", padx=8, pady=4,
+                            cursor="hand2", font=("Microsoft YaHei", 9, "bold"))
+            btn.pack(side="right", padx=2)
+            nav_period["buttons"][key] = btn
+        chart.bind("<Configure>", lambda _event: schedule_redraw(120))
+        win.after(180, redraw_nav)
 
         detail = tk.Frame(win, bg=COLORS["panel"], highlightbackground=COLORS["line"], highlightthickness=1)
         detail.pack(fill="x", padx=18, pady=(0, 16))
@@ -1481,9 +1905,17 @@ def _install_native_tonghuashun_viewer():
         win.geometry("1360x850")
         win.minsize(1080, 680)
         win.configure(bg=COLORS["bg"])
+        try:
+            win.transient(self.root)
+            win.lift()
+            win.focus_force()
+            win.after(120, win.lift)
+        except Exception:
+            pass
 
-        state = {"sheet": 0, "query": "", "limit": 200, "sort_col": "", "sort_dir": -1, "tree": None, "row_by_iid": {}, "compare_rows": {}}
-        fund_map = _latest_fund_map()
+        state = {"sheet": 0, "query": "", "limit": 200, "sort_col": "", "sort_dir": -1, "tree": None, "row_by_iid": {}, "compare_rows": {}, "render_job": None}
+        fund_map = _LazyFundMap()
+        threading.Thread(target=fund_map.preload, daemon=True).start()
 
         style = ttk.Style(win)
         try:
@@ -1592,8 +2024,9 @@ def _install_native_tonghuashun_viewer():
         chart = tk.Canvas(chart_panel, height=300, bg=COLORS["panel"], highlightthickness=0)
         chart.pack(fill="x", padx=12, pady=8)
 
-        tk.Label(type_panel, text="基金类型分布", bg=COLORS["panel"], fg=COLORS["text"],
-                 font=("Microsoft YaHei", 12, "bold")).pack(anchor="w", padx=14, pady=(12, 8))
+        side_title = tk.Label(type_panel, text="策略信息", bg=COLORS["panel"], fg=COLORS["text"],
+                              font=("Microsoft YaHei", 12, "bold"))
+        side_title.pack(anchor="w", padx=14, pady=(12, 8))
         type_body = tk.Frame(type_panel, bg=COLORS["panel"])
         type_body.pack(fill="both", expand=True, padx=14, pady=(0, 12))
 
@@ -1626,6 +2059,18 @@ def _install_native_tonghuashun_viewer():
         def draw_types():
             for child in type_body.winfo_children():
                 child.destroy()
+            sheet = sheets[state["sheet"]]
+            profile = sheet.get("profile", {})
+            side_title.config(text=f"{profile.get('name', '策略')}信息")
+            tk.Label(type_body, text=f"核心指标：{profile.get('primary') or sheet.get('score_col') or '--'}",
+                     bg=COLORS["panel"], fg=COLORS["gold"], font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(0, 8))
+            shown = 0
+            for col in profile.get("priority", []):
+                if col in sheet["columns"] and shown < 6:
+                    tk.Label(type_body, text=f"- {col}", bg=COLORS["panel"], fg=COLORS["muted"],
+                             font=("Microsoft YaHei", 9)).pack(anchor="w", pady=1)
+                    shown += 1
+            tk.Frame(type_body, bg=COLORS["line"], height=1).pack(fill="x", pady=10)
             top_types = summary["top_types"]
             if not top_types:
                 tk.Label(type_body, text="暂无类型数据", bg=COLORS["panel"], fg=COLORS["muted"]).pack(anchor="w")
@@ -1646,7 +2091,8 @@ def _install_native_tonghuashun_viewer():
 
         def draw_chart(rows):
             sheet = sheets[state["sheet"]]
-            score_col = sheet["score_col"]
+            profile = sheet.get("profile", {})
+            score_col = sheet["score_col"] or _pick_col(sheet["columns"], [profile.get("primary", ""), "评分", "得分"], "")
             chart.delete("all")
             chart.update_idletasks()
             width = max(chart.winfo_width(), 760)
@@ -1656,7 +2102,7 @@ def _install_native_tonghuashun_viewer():
                 value = _num(row.get(score_col)) if score_col else row.get("_score")
                 if value is not None:
                     values.append((row, value))
-            chart_title.config(text=f"{sheet['name']} - {score_col or '数值'} Top {len(values)}")
+            chart_title.config(text=f"{profile.get('name', sheet['name'])} - {score_col or '数值'} Top {len(values)}")
             if not values:
                 chart.create_text(40, 60, text="暂无可绘制数值", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 12))
                 return
@@ -1803,10 +2249,21 @@ def _install_native_tonghuashun_viewer():
             self._log("请先多选至少两只基金，或逐个选中后点击【加入对比】。")
 
         def render():
+            state["render_job"] = None
             state["query"] = search_var.get()
             rows = filtered_rows()
+            draw_types()
             draw_chart(rows)
             render_table(rows)
+
+        def render_later(delay=180):
+            job = state.get("render_job")
+            if job:
+                try:
+                    win.after_cancel(job)
+                except Exception:
+                    pass
+            state["render_job"] = win.after(delay, render)
 
         def switch_sheet(index):
             state["sheet"] = index
@@ -1827,13 +2284,12 @@ def _install_native_tonghuashun_viewer():
             button.pack(fill="x", pady=3)
             nav_buttons.append(button)
 
-        search_var.trace_add("write", lambda *_: render())
+        search_var.trace_add("write", lambda *_: render_later())
         def update_limit(*_):
             text = limit_var.get()
             state["limit"] = 0 if text == "全部" else int(text)
             render()
         limit_var.trace_add("write", update_limit)
-        draw_types()
         render()
         self._log(f"已在软件内打开同花顺风格看板：{path}")
 
@@ -1848,6 +2304,409 @@ def _install_native_tonghuashun_viewer():
 
 
 _install_native_tonghuashun_viewer()
+
+
+def _install_threadsafe_tk_updates():
+    """Route worker-thread UI updates through a Tk polling loop."""
+    try:
+        base_cls = jijin_system.FundToolsApp
+    except Exception:
+        return
+
+    import threading as _threading
+
+    original_build_ui = base_cls._build_ui
+    original_on_progress = getattr(base_cls, "_on_progress", None)
+
+    def _ensure_ui_queue(self):
+        if not hasattr(self, "_ui_queue_lock"):
+            self._ui_queue_lock = _threading.Lock()
+            self._ui_log_queue = []
+            self._ui_progress_text = None
+            self._ui_polling = False
+
+    def _flush_ui_queue(self):
+        _ensure_ui_queue(self)
+        try:
+            logs = []
+            progress_text = None
+            with self._ui_queue_lock:
+                if self._ui_log_queue:
+                    logs = self._ui_log_queue[:300]
+                    del self._ui_log_queue[:300]
+                progress_text = self._ui_progress_text
+                self._ui_progress_text = None
+
+            if logs and hasattr(self, "log_text"):
+                self.log_text.configure(state="normal")
+                self.log_text.insert("end", "".join(logs))
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+
+            if progress_text and hasattr(self, "lbl_progress"):
+                self.lbl_progress.config(text=progress_text)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(80, lambda: _flush_ui_queue(self))
+            except Exception:
+                pass
+
+    def _patched_build_ui(self):
+        original_build_ui(self)
+        _ensure_ui_queue(self)
+        if not getattr(self, "_ui_polling", False):
+            self._ui_polling = True
+            try:
+                self.root.after(80, lambda: _flush_ui_queue(self))
+            except Exception:
+                pass
+
+    def _safe_log(self, msg):
+        _ensure_ui_queue(self)
+        ts = _dt.now().strftime("%H:%M")
+        line = f"[{ts}] {msg}\n"
+        try:
+            with self._ui_queue_lock:
+                self._ui_log_queue.append(line)
+                if len(self._ui_log_queue) > 2000:
+                    self._ui_log_queue = self._ui_log_queue[-1000:]
+        except Exception:
+            try:
+                print(line, end="")
+            except Exception:
+                pass
+
+    def _safe_on_progress(self, ok, total):
+        _ensure_ui_queue(self)
+        try:
+            with self._ui_queue_lock:
+                self._ui_progress_text = f"进度：{ok} / {total} 条"
+        except Exception:
+            if callable(original_on_progress):
+                try:
+                    original_on_progress(self, ok, total)
+                except Exception:
+                    pass
+
+    base_cls._build_ui = _patched_build_ui
+    base_cls._log = _safe_log
+    base_cls._on_progress = _safe_on_progress
+
+
+_install_threadsafe_tk_updates()
+
+
+def _install_streaming_performance_score():
+    """Make the performance scorer stream fund JSON instead of loading nav_history for all funds."""
+    try:
+        calc_age = jijin_system.calc_age
+        parse_pct_to_float = jijin_system.parse_pct_to_float
+        fmt_pct = jijin_system.fmt_pct
+        calc_score = jijin_system.calc_score
+        autosize_excel = jijin_system.autosize_excel
+        pd = jijin_system.pd
+        json = jijin_system.json
+        dt = jijin_system.dt
+    except Exception:
+        return
+
+    def _iter_json_objects(path, log=None):
+        decoder = json.loads
+        buf = []
+        in_obj = False
+        in_str = False
+        escape = False
+        depth = 0
+        count = 0
+        with open(path, "r", encoding="utf-8") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                for ch in chunk:
+                    if not in_obj:
+                        if ch == "{":
+                            in_obj = True
+                            in_str = False
+                            escape = False
+                            depth = 1
+                            buf = [ch]
+                        continue
+
+                    buf.append(ch)
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                        continue
+
+                    if ch == '"':
+                        in_str = True
+                    elif ch in "{[":
+                        depth += 1
+                    elif ch in "}]":
+                        depth -= 1
+                        if depth == 0:
+                            raw = "".join(buf)
+                            buf = []
+                            in_obj = False
+                            try:
+                                yield decoder(raw)
+                                count += 1
+                            except Exception as exc:
+                                if log and count < 3:
+                                    log(f"跳过一条解析失败的数据：{exc}")
+
+    def _latest_profile_file():
+        files = glob.glob(os.path.join(SCRIPT_DIR, "fund_data", "fund_profile_*.json"))
+        files += glob.glob(os.path.join("fund_data", "fund_profile_*.json"))
+        files = [
+            path for path in set(files)
+            if os.path.exists(path) and not path.endswith(".tmp") and os.path.getsize(path) > 1024
+        ]
+        return max(files, key=os.path.getmtime) if files else None
+
+    def _streaming_run_performance_score(log):
+        try:
+            output_dir = "fund_excel"
+            latest_file = _latest_profile_file()
+            if not latest_file:
+                log("未找到 fund_data 目录下的有效 fund_profile JSON，请先爬取数据。")
+                return None
+
+            log(f"正在处理: {latest_file}")
+            log("收益表现采用低内存流式计算：只读取收益字段，不加载全部历史净值。")
+
+            metric_rows = []
+            full_rows = []
+            loaded = 0
+            for item in _iter_json_objects(latest_file, log):
+                if not isinstance(item, dict):
+                    continue
+                perf = item.get("performance", {}) or {}
+                base = item.get("base_info", {}) or {}
+                code = item.get("fund_code")
+                if not code:
+                    continue
+                name = item.get("fund_name")
+                age = calc_age(base.get("setup_date"), perf.get("nav_date"))
+
+                metric_rows.append({
+                    "fund_code": code,
+                    "return_1m": parse_pct_to_float(perf.get("1m")),
+                    "return_3m": parse_pct_to_float(perf.get("3m")),
+                    "return_6m": parse_pct_to_float(perf.get("6m")),
+                    "return_1y": parse_pct_to_float(perf.get("1y")),
+                    "return_3y": parse_pct_to_float(perf.get("3y")),
+                    "return_5y": parse_pct_to_float(perf.get("5y")),
+                })
+                full_rows.append({
+                    "fund_code": code,
+                    "基金名称": name,
+                    "基金代码": code,
+                    "最新净值": perf.get("nav"),
+                    "日增长率": perf.get("daily_growth_rate"),
+                    "近1月": fmt_pct(perf.get("1m")),
+                    "近3月": fmt_pct(perf.get("3m")),
+                    "近6月": fmt_pct(perf.get("6m")),
+                    "近1年": fmt_pct(perf.get("1y")),
+                    "近3年": fmt_pct(perf.get("3y")),
+                    "近5年": fmt_pct(perf.get("5y")),
+                    "成立以来": fmt_pct(perf.get("since")),
+                    "基金类型": base.get("fund_type"),
+                    "风险等级": base.get("risk_level"),
+                    "规模": base.get("assets_size"),
+                    "基金经理": base.get("manager"),
+                    "成立日期": base.get("setup_date"),
+                    "净值日期": perf.get("nav_date"),
+                    "成立年限": age,
+                })
+                loaded += 1
+                if loaded % 5000 == 0:
+                    log(f"已读取 {loaded:,} 只基金...")
+
+            if not full_rows:
+                log("JSON 文件中无有效数据。")
+                return None
+
+            log(f"共加载 {loaded:,} 只基金，开始计算收益表现评分...")
+            metric_df = pd.DataFrame(metric_rows).set_index("fund_code")
+            full_df = pd.DataFrame(full_rows).set_index("fund_code")
+            full_df["收益表现评分"] = calc_score(metric_df, full_df["成立年限"])
+            out = full_df.reset_index(drop=True).sort_values(by="收益表现评分", ascending=False)
+
+            os.makedirs(output_dir, exist_ok=True)
+            ts = dt.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(output_dir, f"收益表现评分_{ts}.xlsx")
+            out.to_excel(out_path, index=False)
+            autosize_excel(out_path)
+
+            log(f"评分计算完成！共 {len(out):,} 只基金")
+            log(f"已导出美化Excel: {out_path}")
+            return os.path.abspath(out_path)
+        except Exception as exc:
+            import traceback
+            log(f"收益表现评分出错: {exc}")
+            log(traceback.format_exc())
+            return None
+
+    jijin_system.run_performance_score = _streaming_run_performance_score
+
+
+_install_streaming_performance_score()
+
+
+def _install_streaming_risk_drawdown():
+    """Make risk drawdown scoring stream JSON and export only the dashboard sheet."""
+    try:
+        json = jijin_system.json
+        pd = jijin_system.pd
+        dt = jijin_system.dt
+        calc_risk = jijin_system._calc_risk_metrics_from_history
+        beautify = jijin_system._beautify_risk_excel
+    except Exception:
+        return
+
+    def _iter_json_objects(path):
+        buf = []
+        in_obj = False
+        in_str = False
+        escape = False
+        depth = 0
+        with open(path, "r", encoding="utf-8") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                for ch in chunk:
+                    if not in_obj:
+                        if ch == "{":
+                            in_obj = True
+                            in_str = False
+                            escape = False
+                            depth = 1
+                            buf = [ch]
+                        continue
+                    buf.append(ch)
+                    if in_str:
+                        if escape:
+                            escape = False
+                        elif ch == "\\":
+                            escape = True
+                        elif ch == '"':
+                            in_str = False
+                        continue
+                    if ch == '"':
+                        in_str = True
+                    elif ch in "{[":
+                        depth += 1
+                    elif ch in "}]":
+                        depth -= 1
+                        if depth == 0:
+                            raw = "".join(buf)
+                            buf = []
+                            in_obj = False
+                            try:
+                                yield json.loads(raw)
+                            except Exception:
+                                continue
+
+    def _latest_profile_file():
+        files = glob.glob(os.path.join(SCRIPT_DIR, "fund_data", "fund_profile_*.json"))
+        files += glob.glob(os.path.join("fund_data", "fund_profile_*.json"))
+        files = [
+            path for path in set(files)
+            if os.path.exists(path) and not path.endswith(".tmp") and os.path.getsize(path) > 1024
+        ]
+        return max(files, key=os.path.getmtime) if files else None
+
+    def _streaming_run_risk_drawdown(log):
+        try:
+            output_dir = "fund_excel"
+            latest_file = _latest_profile_file()
+            if not latest_file:
+                log("未找到 fund_data 目录下的有效 fund_profile JSON，请先运行【开始爬取】。")
+                return None
+
+            log(f"正在处理: {latest_file}")
+            log("风险回撤采用低内存流式计算：逐只基金计算，不写入几万张历史Sheet。")
+
+            summary_list = []
+            total = 0
+            has_hist = 0
+            computed = 0
+            for item in _iter_json_objects(latest_file):
+                if not isinstance(item, dict):
+                    continue
+                total += 1
+                code = str(item.get("fund_code", "")).zfill(6)
+                name = item.get("fund_name", "--")
+                base = item.get("base_info", {}) or {}
+                hist = item.get("nav_history") or []
+
+                row = {
+                    "代码": code,
+                    "名称": name,
+                    "类型": base.get("fund_type", "--"),
+                    "规模": base.get("assets_size", "--"),
+                    "经理": base.get("manager", "--"),
+                }
+                if hist:
+                    has_hist += 1
+                metrics, _df_hist = calc_risk(hist)
+                if metrics:
+                    row.update(metrics)
+                    computed += 1
+                summary_list.append(row)
+
+                if total % 1000 == 0:
+                    log(f"风险回撤进度：已处理 {total:,} 只，成功计算 {computed:,} 只。")
+
+            if total == 0:
+                log("JSON 文件中无有效数据。")
+                return None
+            if has_hist == 0:
+                log("当前 JSON 中未包含历史净值（nav_history）。")
+                log("请重新点击【开始爬取】以生成含历史净值的数据文件，再运行本功能。")
+                return None
+
+            df_raw = pd.DataFrame(summary_list)
+            display_cols = [
+                "代码", "名称", "夏普比率", "卡玛比率", "索提诺比率",
+                "年化收益", "最大回撤", "当前回撤", "回撤状态", "回撤进度",
+                "决策建议", "波动率", "下行波动", "溃疡指数",
+                "类型", "规模", "经理",
+            ]
+            df_final = df_raw[[c for c in display_cols if c in df_raw.columns]].copy()
+            if "夏普比率" in df_final.columns:
+                df_final = df_final.sort_values("夏普比率", ascending=False, na_position="last")
+
+            os.makedirs(output_dir, exist_ok=True)
+            ts = dt.now().strftime("%m%d_%H%M")
+            out_path = os.path.join(output_dir, f"基金风险决策看板_{ts}.xlsx")
+            with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+                df_final.to_excel(writer, sheet_name="决策看板", index=False)
+            beautify(out_path)
+
+            log(f"风险与回撤分析完成！共 {len(df_final):,} 只基金，成功计算 {computed:,} 只。")
+            log("历史走势请在软件内结果看板中双击基金或使用走势对比查看。")
+            log(f"已导出美化Excel: {out_path}")
+            return os.path.abspath(out_path)
+        except Exception as exc:
+            import traceback
+            log(f"风险与回撤分析出错: {exc}")
+            log(traceback.format_exc())
+            return None
+
+    jijin_system.run_risk_drawdown = _streaming_run_risk_drawdown
+
+
+_install_streaming_risk_drawdown()
 
 
 def _install_market_home_panel():
@@ -1999,8 +2858,7 @@ def _install_market_home_panel():
         original_build_ui(self)
         _build_market_panel(self)
 
-    if getattr(base_cls._build_ui, "__name__", "") != "_patched_build_ui":
-        base_cls._build_ui = _patched_build_ui
+    base_cls._build_ui = _patched_build_ui
 
 
 _install_market_home_panel()
@@ -2753,7 +3611,10 @@ def _install_precompute_cache():
         os.replace(tmp_path, CACHE_INDEX)
 
     def _latest_data_stamp():
-        files = glob.glob(os.path.join("fund_data", "*.json"))
+        files = [
+            path for path in glob.glob(os.path.join("fund_data", "fund_profile_*.json"))
+            if not path.endswith(".tmp") and os.path.getsize(path) > 1024
+        ]
         if not files:
             return ""
         latest = max(files, key=os.path.getmtime)
@@ -2817,19 +3678,43 @@ def _install_precompute_cache():
         return None
 
     def _open_cached_or_compute(self, key, title, func):
+        if getattr(self, "_module_job_running", False):
+            self._log("已有模块正在计算中，请等待完成后再点击其它按钮。")
+            return
         cached = _cache_get(key)
         if cached:
             self._log(f"{title} 使用一键运行缓存，马上加载。")
             self.root.after(0, lambda p=cached: self._ask_open_excel(p))
             return
 
+        self._module_job_running = True
+        try:
+            self.root.after(0, lambda: self._update_status(f"{title}计算中", "#f9e2af"))
+        except Exception:
+            pass
+        self._log(f"{title} 没有可用缓存，正在重新计算；完成后会自动弹窗。")
+
         def _task():
-            path = _run_job_with_cache(key, title, func, self._log, force=True)
-            if path:
-                self.root.after(0, lambda p=path: self._ask_open_excel(p))
+            try:
+                path = _run_job_with_cache(key, title, func, self._log, force=True)
+                if path:
+                    self.root.after(0, lambda p=path: self._ask_open_excel(p))
+                else:
+                    self._log(f"{title} 没有生成可展示结果，请查看上方运行日志。")
+            except Exception as exc:
+                self._log(f"{title} 计算失败：{exc}")
+            finally:
+                self._module_job_running = False
+                try:
+                    self.root.after(0, lambda: self._update_status("就绪", "#6c7086"))
+                except Exception:
+                    pass
         threading.Thread(target=_task, daemon=True).start()
 
     def _run_topic_cached(self, topic_name):
+        if getattr(self, "_module_job_running", False):
+            self._log("已有模块正在计算中，请等待完成后再点击其它按钮。")
+            return
         key = f"topic::{topic_name}"
         title = f"{topic_name}专题"
         cached = _cache_get(key)
@@ -2838,16 +3723,34 @@ def _install_precompute_cache():
             self.root.after(0, lambda p=cached: self._ask_open_excel(p))
             return
 
+        self._module_job_running = True
+        try:
+            self.root.after(0, lambda: self._update_status(f"{title}计算中", "#f9e2af"))
+        except Exception:
+            pass
+        self._log(f"{title} 没有可用缓存，正在重新计算；完成后会自动弹窗。")
+
         def _task():
-            path = _run_job_with_cache(
-                key,
-                title,
-                lambda log: jijin_system.run_topic_screen(topic_name, log),
-                self._log,
-                force=True,
-            )
-            if path:
-                self.root.after(0, lambda p=path: self._ask_open_excel(p))
+            try:
+                path = _run_job_with_cache(
+                    key,
+                    title,
+                    lambda log: jijin_system.run_topic_screen(topic_name, log),
+                    self._log,
+                    force=True,
+                )
+                if path:
+                    self.root.after(0, lambda p=path: self._ask_open_excel(p))
+                else:
+                    self._log(f"{title} 没有生成可展示结果，请查看上方运行日志。")
+            except Exception as exc:
+                self._log(f"{title} 计算失败：{exc}")
+            finally:
+                self._module_job_running = False
+                try:
+                    self.root.after(0, lambda: self._update_status("就绪", "#6c7086"))
+                except Exception:
+                    pass
         threading.Thread(target=_task, daemon=True).start()
 
     def _precompute_all(self, log):
