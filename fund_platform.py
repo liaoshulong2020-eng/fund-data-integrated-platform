@@ -79,6 +79,243 @@ INDEX_HTML = EMBEDDED_SOURCES['static/index.html']
 
 FUND_DATA_DIR = os.path.join(SCRIPT_DIR, 'fund_data')
 
+
+# ========================================================
+# Fast local data index
+# ========================================================
+# The latest fund_profile JSON can be hundreds of MB because it contains
+# nav_history for every fund. Loading that file on a UI click makes Tkinter
+# appear frozen. Keep a SQLite code -> fund-json index so detail/compare views
+# can read one fund at a time.
+_INDEX_BUILDING = False
+_INDEX_LOCK = threading.Lock()
+_INDEX_READY_CACHE = {"key": None, "ready": False}
+
+
+def _latest_fund_profile_file():
+    files = glob.glob(os.path.join(SCRIPT_DIR, "fund_data", "fund_profile_*.json"))
+    files = [p for p in files if not p.endswith(".tmp") and os.path.getsize(p) > 1024]
+    if not files:
+        return None
+    return max(files, key=os.path.getmtime)
+
+
+def _fund_index_db_path():
+    return os.path.join(SCRIPT_DIR, "fund_cache", "fund_index.sqlite")
+
+
+def _iter_json_array_items(path):
+    import json as _json
+
+    decoder = _json.JSONDecoder()
+    chunk_size = 1024 * 1024
+    with open(path, "r", encoding="utf-8") as f:
+        buf = ""
+        pos = 0
+        eof = False
+        started = False
+        while True:
+            if not eof and len(buf) - pos < chunk_size // 2:
+                buf = buf[pos:]
+                pos = 0
+                chunk = f.read(chunk_size)
+                if chunk:
+                    buf += chunk
+                else:
+                    eof = True
+
+            while pos < len(buf) and buf[pos] in " \r\n\t,":
+                pos += 1
+
+            if not started:
+                if pos >= len(buf):
+                    if eof:
+                        return
+                    continue
+                if buf[pos] == "[":
+                    started = True
+                    pos += 1
+                    continue
+                raise ValueError("fund_profile JSON must be an array")
+
+            if pos >= len(buf):
+                if eof:
+                    return
+                continue
+            if buf[pos] == "]":
+                return
+
+            try:
+                item, end = decoder.raw_decode(buf, pos)
+            except _json.JSONDecodeError:
+                if eof:
+                    raise
+                continue
+            pos = end
+            yield item
+
+
+def _fund_index_is_ready(data_path=None):
+    import sqlite3 as _sqlite3
+
+    data_path = data_path or _latest_fund_profile_file()
+    if not data_path:
+        return False
+    db_path = _fund_index_db_path()
+    if not os.path.exists(db_path):
+        return False
+    cache_key = (
+        os.path.abspath(data_path),
+        os.path.getmtime(data_path),
+        os.path.getsize(data_path),
+        os.path.getmtime(db_path),
+        os.path.getsize(db_path),
+    )
+    if _INDEX_READY_CACHE.get("key") == cache_key:
+        return _INDEX_READY_CACHE.get("ready", False)
+    try:
+        conn = _sqlite3.connect(db_path, timeout=1)
+        cur = conn.cursor()
+        cur.execute("select value from meta where key='source_path'")
+        source_path = cur.fetchone()
+        cur.execute("select value from meta where key='source_mtime'")
+        source_mtime = cur.fetchone()
+        cur.execute("select value from meta where key='source_size'")
+        source_size = cur.fetchone()
+        conn.close()
+        ready = (
+            source_path and source_path[0] == os.path.abspath(data_path)
+            and source_mtime and source_mtime[0] == str(os.path.getmtime(data_path))
+            and source_size and source_size[0] == str(os.path.getsize(data_path))
+        )
+        _INDEX_READY_CACHE["key"] = cache_key
+        _INDEX_READY_CACHE["ready"] = bool(ready)
+        return bool(ready)
+    except Exception:
+        _INDEX_READY_CACHE["key"] = cache_key
+        _INDEX_READY_CACHE["ready"] = False
+        return False
+
+
+def _build_fund_index(data_path=None, log=None):
+    import json as _json
+    import sqlite3 as _sqlite3
+    import time as _time
+
+    data_path = data_path or _latest_fund_profile_file()
+    if not data_path:
+        if log:
+            log("未找到基金 JSON，跳过索引构建。")
+        return False
+    if _fund_index_is_ready(data_path):
+        if log:
+            log("基金详情索引已是最新。")
+        return True
+
+    os.makedirs(os.path.join(SCRIPT_DIR, "fund_cache"), exist_ok=True)
+    db_path = _fund_index_db_path()
+    tmp_path = db_path + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    t0 = _time.time()
+    conn = _sqlite3.connect(tmp_path)
+    cur = conn.cursor()
+    cur.execute("pragma journal_mode=off")
+    cur.execute("pragma synchronous=off")
+    cur.execute("create table meta (key text primary key, value text)")
+    cur.execute("create table funds (code text primary key, name text, detail_json text)")
+    count = 0
+    batch = []
+    for item in _iter_json_array_items(data_path):
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("fund_code", "")).zfill(6)
+        if not code.strip("0"):
+            continue
+        name = str(item.get("fund_name") or "")
+        batch.append((code, name, _json.dumps(item, ensure_ascii=False, separators=(",", ":"))))
+        count += 1
+        if len(batch) >= 500:
+            cur.executemany("insert or replace into funds(code,name,detail_json) values(?,?,?)", batch)
+            batch.clear()
+    if batch:
+        cur.executemany("insert or replace into funds(code,name,detail_json) values(?,?,?)", batch)
+    cur.executemany(
+        "insert into meta(key,value) values(?,?)",
+        [
+            ("source_path", os.path.abspath(data_path)),
+            ("source_mtime", str(os.path.getmtime(data_path))),
+            ("source_size", str(os.path.getsize(data_path))),
+            ("built_at", _dt.now().strftime("%Y-%m-%d %H:%M:%S")),
+            ("fund_count", str(count)),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    os.replace(tmp_path, db_path)
+    if log:
+        log(f"基金详情索引完成：{count:,} 只，用时 {_time.time() - t0:.1f}s。")
+    return True
+
+
+def _get_fund_from_index(code):
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    code = str(code).zfill(6)
+    if not _fund_index_is_ready():
+        return None
+    try:
+        conn = _sqlite3.connect(_fund_index_db_path(), timeout=1)
+        cur = conn.cursor()
+        cur.execute("select detail_json from funds where code=?", (code,))
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            return _json.loads(row[0])
+    except Exception:
+        return None
+    return None
+
+
+def _ensure_fund_index_async(log=None):
+    global _INDEX_BUILDING
+    data_path = _latest_fund_profile_file()
+    if not data_path or _fund_index_is_ready(data_path):
+        return
+    with _INDEX_LOCK:
+        if _INDEX_BUILDING:
+            return
+        _INDEX_BUILDING = True
+
+    def _worker():
+        global _INDEX_BUILDING
+        try:
+            import subprocess as _subprocess
+            if log:
+                log("正在后台建立基金详情索引；这是独立进程，不会阻塞界面。")
+            proc = _subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--build-fund-index", data_path],
+                cwd=SCRIPT_DIR,
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+                creationflags=getattr(_subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            proc.wait()
+            if log:
+                if proc.returncode == 0 and _fund_index_is_ready(data_path):
+                    log("基金详情索引已完成，详情/走势/对比将按代码快速读取。")
+                else:
+                    log("基金详情索引未完成，可稍后再点详情或重新运行。")
+        except Exception as exc:
+            if log:
+                log(f"基金详情索引失败：{exc}")
+        finally:
+            _INDEX_BUILDING = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 # Ensure embedded Flask app reads fund_data from this workspace first
 try:
     # prefer fund_data next to this unified_system.py
@@ -429,10 +666,7 @@ def _install_integrated_result_viewer():
         win.minsize(980, 640)
         win.configure(bg="#0f172a")
         try:
-            win.transient(self.root)
-            win.lift()
-            win.focus_force()
-            win.after(120, win.lift)
+            win.focus_set()
         except Exception:
             pass
 
@@ -1247,8 +1481,8 @@ def _install_native_tonghuashun_viewer():
                 score_col = best_col
 
             rows = []
-            for _, record in df.iterrows():
-                row = {str(col): _clean(record[col]) for col in df.columns}
+            for record in df.to_dict("records"):
+                row = {str(col): _clean(record.get(col, "")) for col in df.columns}
                 if "今日涨幅" not in row:
                     row["今日涨幅"] = row.get("日增长率", row.get("日涨跌幅", ""))
                 score = _num(row.get(score_col)) if score_col else None
@@ -1349,24 +1583,17 @@ def _install_native_tonghuashun_viewer():
             self._lock = threading.Lock()
 
         def preload(self):
-            self._ensure_loaded()
+            _ensure_fund_index_async()
 
         def _ensure_loaded(self):
-            if self._loaded:
-                return
-            with self._lock:
-                if self._loaded:
-                    return
-                self._loading = True
-                try:
-                    self._data = _latest_fund_map()
-                finally:
-                    self._loaded = True
-                    self._loading = False
+            self._loaded = True
 
         def get(self, code, default=None):
-            self._ensure_loaded()
-            return self._data.get(str(code).zfill(6), default)
+            fund = _get_fund_from_index(code)
+            if fund:
+                return fund
+            _ensure_fund_index_async()
+            return default
 
     def _fund_code_from_row(row, sheet):
         code = row.get("_code") or row.get(sheet.get("code_col", ""))
@@ -1491,6 +1718,21 @@ def _install_native_tonghuashun_viewer():
         max_v += pad
         span = max(max_v - min_v, 1e-9)
 
+        max_draw_points = max(360, min(1200, int(chart_w // 2) if chart_w > 0 else 760))
+        if len(points) > max_draw_points:
+            sample_step = max(1, len(points) // max_draw_points)
+            draw_points = [(idx, item) for idx, item in enumerate(points) if idx % sample_step == 0]
+            if draw_points[-1][0] != len(points) - 1:
+                draw_points.append((len(points) - 1, points[-1]))
+        else:
+            draw_points = list(enumerate(points))
+
+        def x_at(index):
+            return pad_l + chart_w * index / max(len(points) - 1, 1)
+
+        def y_at(value):
+            return pad_t + chart_h - (value - min_v) / span * chart_h
+
         peak_val = points[0][2]
         peak_idx = 0
         max_dd = 0.0
@@ -1547,27 +1789,25 @@ def _install_native_tonghuashun_viewer():
             canvas.create_text(10, y, text=f"{value:.4f}", fill=COLORS["muted"], anchor="w", font=("Microsoft YaHei", 9))
 
         coords = []
-        xy = []
-        for idx, (_date_obj, _date_text, value) in enumerate(points):
-            x = pad_l + chart_w * idx / max(len(points) - 1, 1)
-            y = pad_t + chart_h - (value - min_v) / span * chart_h
+        for idx, (_date_obj, _date_text, value) in draw_points:
+            x = x_at(idx)
+            y = y_at(value)
             coords.extend([x, y])
-            xy.append((x, y))
         if len(coords) >= 4:
-            px, _py = xy[max_peak_idx]
-            tx, ty = xy[max_trough_idx]
+            px, py_peak = x_at(max_peak_idx), y_at(points[max_peak_idx][2])
+            tx, ty = x_at(max_trough_idx), y_at(points[max_trough_idx][2])
             canvas.create_rectangle(px, pad_t, tx, pad_t + chart_h, fill="#1f2737", outline="")
             fill_poly = [pad_l, pad_t + chart_h] + coords + [width - pad_r, pad_t + chart_h]
             canvas.create_polygon(*fill_poly, fill="#2b1720", outline="")
             canvas.create_line(*coords, fill=COLORS["red"], width=2)
             canvas.create_line(px, pad_t, px, pad_t + chart_h, fill=COLORS["gold"], dash=(4, 3))
             canvas.create_line(tx, pad_t, tx, pad_t + chart_h, fill=COLORS["green"], dash=(4, 3))
-            canvas.create_oval(px - 4, xy[max_peak_idx][1] - 4, px + 4, xy[max_peak_idx][1] + 4, fill=COLORS["gold"], outline="")
+            canvas.create_oval(px - 4, py_peak - 4, px + 4, py_peak + 4, fill=COLORS["gold"], outline="")
             canvas.create_oval(tx - 4, ty - 4, tx + 4, ty + 4, fill=COLORS["green"], outline="")
-            canvas.create_text(px + 8, xy[max_peak_idx][1] - 14, text="回撤起点", fill=COLORS["gold"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
+            canvas.create_text(px + 8, py_peak - 14, text="回撤起点", fill=COLORS["gold"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
             canvas.create_text(tx + 8, ty + 16, text=f"最大回撤 {max_dd * 100:.2f}% | 下跌{fall_days}天", fill=COLORS["green"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
-            if repair_idx is not None and repair_idx < len(xy):
-                rx, ry = xy[repair_idx]
+            if repair_idx is not None and repair_idx < len(points):
+                rx, ry = x_at(repair_idx), y_at(points[repair_idx][2])
                 canvas.create_line(rx, pad_t, rx, pad_t + chart_h, fill=COLORS["blue"], dash=(4, 3))
                 canvas.create_oval(rx - 4, ry - 4, rx + 4, ry + 4, fill=COLORS["blue"], outline="")
                 canvas.create_text(rx + 8, ry - 14, text="修复完成", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei", 8, "bold"))
@@ -1581,17 +1821,17 @@ def _install_native_tonghuashun_viewer():
         if tick_indexes[-1] != len(points) - 1:
             tick_indexes.append(len(points) - 1)
         for idx in tick_indexes[:7]:
-            x = pad_l + chart_w * idx / max(len(points) - 1, 1)
+            x = x_at(idx)
             canvas.create_line(x, pad_t + chart_h, x, pad_t + chart_h + 4, fill=COLORS["line"])
             canvas.create_text(x, height - 22, text=points[idx][1][5:], fill=COLORS["muted"], font=("Microsoft YaHei", 8))
 
         def draw_crosshair(event):
-            if not xy:
+            if not points:
                 return
             x = min(max(event.x, pad_l), width - pad_r)
             idx = int(round((x - pad_l) / max(chart_w, 1) * (len(points) - 1)))
             idx = max(0, min(idx, len(points) - 1))
-            px, py = xy[idx]
+            px, py = x_at(idx), y_at(points[idx][2])
             date_text = points[idx][1]
             nav_value = points[idx][2]
             if idx > 0 and points[idx - 1][2]:
@@ -1906,16 +2146,12 @@ def _install_native_tonghuashun_viewer():
         win.minsize(1080, 680)
         win.configure(bg=COLORS["bg"])
         try:
-            win.transient(self.root)
-            win.lift()
-            win.focus_force()
-            win.after(120, win.lift)
+            win.focus_set()
         except Exception:
             pass
 
-        state = {"sheet": 0, "query": "", "limit": 200, "sort_col": "", "sort_dir": -1, "tree": None, "row_by_iid": {}, "compare_rows": {}, "render_job": None}
+        state = {"sheet": 0, "query": "", "limit": 200, "sort_col": "", "sort_dir": -1, "tree": None, "row_by_iid": {}, "compare_rows": {}, "render_job": None, "table_job": None}
         fund_map = _LazyFundMap()
-        threading.Thread(target=fund_map.preload, daemon=True).start()
 
         style = ttk.Style(win)
         try:
@@ -2128,6 +2364,13 @@ def _install_native_tonghuashun_viewer():
                 chart.create_text(x, y - 8, text=f"{value:.1f}", fill=color, font=("Microsoft YaHei", 8, "bold"))
 
         def render_table(rows):
+            old_job = state.get("table_job")
+            if old_job:
+                try:
+                    win.after_cancel(old_job)
+                except Exception:
+                    pass
+                state["table_job"] = None
             for child in table_frame.winfo_children():
                 child.destroy()
             sheet = sheets[state["sheet"]]
@@ -2163,22 +2406,36 @@ def _install_native_tonghuashun_viewer():
                     width = 62
                 tree.column(col, width=width, minwidth=width, anchor="center", stretch=False)
 
-            for idx, row in enumerate(rows, 1):
-                vals = [idx] + [row.get(col, "") for col in sheet["columns"]]
-                score = row.get(sheet["score_col"], row.get("_score"))
-                tags = ["odd"] if idx % 2 else []
-                change_value = None
-                for change_col in ("今日涨幅", "日增长率", "日涨跌幅", "涨跌幅", "近1月", "近3月", "近6月", "近1年"):
-                    if change_col in row:
-                        change_value = _num(row.get(change_col))
-                        if change_value is not None:
-                            break
-                numeric_score = _num(score)
-                color_value = change_value if change_value is not None else numeric_score
-                if color_value is not None:
-                    tags.append("pos" if color_value >= 0 else "neg")
-                iid = tree.insert("", "end", values=vals, tags=tags)
-                state["row_by_iid"][iid] = row
+            insert_index = {"value": 0}
+
+            def insert_chunk():
+                if state.get("tree") is not tree:
+                    return
+                start = insert_index["value"]
+                end = min(start + 60, len(rows))
+                for pos in range(start, end):
+                    idx = pos + 1
+                    row = rows[pos]
+                    vals = [idx] + [row.get(col, "") for col in sheet["columns"]]
+                    score = row.get(sheet["score_col"], row.get("_score"))
+                    tags = ["odd"] if idx % 2 else []
+                    change_value = None
+                    for change_col in ("今日涨幅", "日增长率", "日涨跌幅", "涨跌幅", "近1月", "近3月", "近6月", "近1年"):
+                        if change_col in row:
+                            change_value = _num(row.get(change_col))
+                            if change_value is not None:
+                                break
+                    numeric_score = _num(score)
+                    color_value = change_value if change_value is not None else numeric_score
+                    if color_value is not None:
+                        tags.append("pos" if color_value >= 0 else "neg")
+                    iid = tree.insert("", "end", values=vals, tags=tags)
+                    state["row_by_iid"][iid] = row
+                insert_index["value"] = end
+                if end < len(rows):
+                    state["table_job"] = win.after(8, insert_chunk)
+                else:
+                    state["table_job"] = None
 
             def on_double_click(_event=None):
                 selection = tree.selection()
@@ -2195,6 +2452,7 @@ def _install_native_tonghuashun_viewer():
             hsb.grid(row=1, column=0, sticky="ew")
             table_frame.rowconfigure(0, weight=1)
             table_frame.columnconfigure(0, weight=1)
+            insert_chunk()
 
         def selected_rows():
             tree = state.get("tree")
@@ -2332,14 +2590,20 @@ def _install_threadsafe_tk_updates():
             progress_text = None
             with self._ui_queue_lock:
                 if self._ui_log_queue:
-                    logs = self._ui_log_queue[:300]
-                    del self._ui_log_queue[:300]
+                    logs = self._ui_log_queue[:80]
+                    del self._ui_log_queue[:80]
                 progress_text = self._ui_progress_text
                 self._ui_progress_text = None
 
             if logs and hasattr(self, "log_text"):
                 self.log_text.configure(state="normal")
                 self.log_text.insert("end", "".join(logs))
+                try:
+                    line_count = int(float(self.log_text.index("end-1c").split(".")[0]))
+                    if line_count > 1200:
+                        self.log_text.delete("1.0", f"{line_count - 800}.0")
+                except Exception:
+                    pass
                 self.log_text.see("end")
                 self.log_text.configure(state="disabled")
 
@@ -2362,6 +2626,10 @@ def _install_threadsafe_tk_updates():
                 self.root.after(80, lambda: _flush_ui_queue(self))
             except Exception:
                 pass
+        try:
+            self.root.after(1200, lambda: _ensure_fund_index_async(self._log))
+        except Exception:
+            pass
 
     def _safe_log(self, msg):
         _ensure_ui_queue(self)
@@ -3431,11 +3699,11 @@ def _install_portfolio_module():
             return []
 
     def _calc_portfolio_rows():
-        fund_map = _latest_fund_map()
+        _ensure_fund_index_async()
         rows, total_cost, total_value, daily_profit = [], 0.0, 0.0, 0.0
         for h in _load_portfolio():
             code = str(h.get("code", "")).zfill(6)
-            fund = fund_map.get(code, {})
+            fund = _get_fund_from_index(code) or {}
             perf = fund.get("performance", {}) or {}
             latest_nav = _num(perf.get("nav"))
             daily_pct = _num(perf.get("daily_growth_rate")) or 0.0
@@ -3587,10 +3855,15 @@ def _install_precompute_cache():
     import os
     import threading
     import time
+    from concurrent.futures import ThreadPoolExecutor
     from datetime import datetime as _dt
 
     CACHE_DIR = "fund_cache"
     CACHE_INDEX = os.path.join(CACHE_DIR, "module_results.json")
+    MODULE_MAX_WORKERS = int(os.environ.get("FUND_MODULE_WORKERS", "2"))
+    MODULE_MAX_WORKERS = max(1, min(4, MODULE_MAX_WORKERS))
+    MODULE_EXECUTOR = ThreadPoolExecutor(max_workers=MODULE_MAX_WORKERS, thread_name_prefix="fund-module")
+    MODULE_STATE_LOCK = threading.Lock()
 
     def _ensure_cache_dir():
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -3677,26 +3950,103 @@ def _install_precompute_cache():
         log(f"{title} 未生成结果。")
         return None
 
+    def _run_job_with_cache_process(key, title, log, *, force=False):
+        import subprocess
+
+        if not force:
+            cached = _cache_get(key)
+            if cached:
+                log(f"{title} 已有预计算缓存，直接打开。")
+                return cached
+
+        log(f"{title} 将在独立进程中计算，主界面可继续操作。")
+        args = [sys.executable, os.path.abspath(__file__), "--run-module", key]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        proc = subprocess.Popen(
+            args,
+            cwd=SCRIPT_DIR,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        result_path = None
+        line_count = 0
+        important_words = ("开始", "完成", "出错", "失败", "已保存", "已缓存", "共加载", "筛选", "处理", "Traceback")
+        for raw_line in proc.stdout or []:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            if line.startswith("__RESULT_PATH__="):
+                result_path = line.split("=", 1)[1].strip() or None
+                continue
+            line_count += 1
+            if any(word in line for word in important_words) or line_count % 120 == 0:
+                log(f"{title}｜{line}")
+        code = proc.wait()
+        if code != 0:
+            log(f"{title} 独立进程退出码 {code}。")
+        if result_path and os.path.exists(result_path):
+            cached_path = _cache_set(key, result_path, title)
+            log(f"{title} 已缓存：{cached_path}")
+            return cached_path
+        log(f"{title} 未生成结果。")
+        return None
+
+    def _ensure_module_state(self):
+        if not hasattr(self, "_module_jobs_running"):
+            self._module_jobs_running = set()
+            self._module_jobs_done = 0
+
+    def _module_status_text(self):
+        _ensure_module_state(self)
+        count = len(self._module_jobs_running)
+        return "就绪" if count <= 0 else f"后台计算 {count} 个模块"
+
+    def _mark_module_start(self, key, title):
+        _ensure_module_state(self)
+        with MODULE_STATE_LOCK:
+            if key in self._module_jobs_running:
+                return False
+            self._module_jobs_running.add(key)
+        try:
+            self.root.after(0, lambda: self._update_status(_module_status_text(self), "#f9e2af"))
+        except Exception:
+            pass
+        self._log(f"{title} 已加入后台任务；当前最多并发 {MODULE_MAX_WORKERS} 个模块。")
+        return True
+
+    def _mark_module_done(self, key):
+        _ensure_module_state(self)
+        with MODULE_STATE_LOCK:
+            self._module_jobs_running.discard(key)
+            self._module_jobs_done = getattr(self, "_module_jobs_done", 0) + 1
+        try:
+            color = "#6c7086" if not self._module_jobs_running else "#f9e2af"
+            self.root.after(0, lambda: self._update_status(_module_status_text(self), color))
+        except Exception:
+            pass
+
     def _open_cached_or_compute(self, key, title, func):
-        if getattr(self, "_module_job_running", False):
-            self._log("已有模块正在计算中，请等待完成后再点击其它按钮。")
-            return
         cached = _cache_get(key)
         if cached:
             self._log(f"{title} 使用一键运行缓存，马上加载。")
             self.root.after(0, lambda p=cached: self._ask_open_excel(p))
             return
 
-        self._module_job_running = True
-        try:
-            self.root.after(0, lambda: self._update_status(f"{title}计算中", "#f9e2af"))
-        except Exception:
-            pass
+        if not _mark_module_start(self, key, title):
+            self._log(f"{title} 已在后台计算中，请勿重复点击同一模块。")
+            return
         self._log(f"{title} 没有可用缓存，正在重新计算；完成后会自动弹窗。")
 
         def _task():
             try:
-                path = _run_job_with_cache(key, title, func, self._log, force=True)
+                path = _run_job_with_cache_process(key, title, self._log, force=True)
                 if path:
                     self.root.after(0, lambda p=path: self._ask_open_excel(p))
                 else:
@@ -3704,17 +4054,10 @@ def _install_precompute_cache():
             except Exception as exc:
                 self._log(f"{title} 计算失败：{exc}")
             finally:
-                self._module_job_running = False
-                try:
-                    self.root.after(0, lambda: self._update_status("就绪", "#6c7086"))
-                except Exception:
-                    pass
-        threading.Thread(target=_task, daemon=True).start()
+                _mark_module_done(self, key)
+        MODULE_EXECUTOR.submit(_task)
 
     def _run_topic_cached(self, topic_name):
-        if getattr(self, "_module_job_running", False):
-            self._log("已有模块正在计算中，请等待完成后再点击其它按钮。")
-            return
         key = f"topic::{topic_name}"
         title = f"{topic_name}专题"
         cached = _cache_get(key)
@@ -3723,22 +4066,14 @@ def _install_precompute_cache():
             self.root.after(0, lambda p=cached: self._ask_open_excel(p))
             return
 
-        self._module_job_running = True
-        try:
-            self.root.after(0, lambda: self._update_status(f"{title}计算中", "#f9e2af"))
-        except Exception:
-            pass
+        if not _mark_module_start(self, key, title):
+            self._log(f"{title} 已在后台计算中，请勿重复点击同一专题。")
+            return
         self._log(f"{title} 没有可用缓存，正在重新计算；完成后会自动弹窗。")
 
         def _task():
             try:
-                path = _run_job_with_cache(
-                    key,
-                    title,
-                    lambda log: jijin_system.run_topic_screen(topic_name, log),
-                    self._log,
-                    force=True,
-                )
+                path = _run_job_with_cache_process(key, title, self._log, force=True)
                 if path:
                     self.root.after(0, lambda p=path: self._ask_open_excel(p))
                 else:
@@ -3746,12 +4081,8 @@ def _install_precompute_cache():
             except Exception as exc:
                 self._log(f"{title} 计算失败：{exc}")
             finally:
-                self._module_job_running = False
-                try:
-                    self.root.after(0, lambda: self._update_status("就绪", "#6c7086"))
-                except Exception:
-                    pass
-        threading.Thread(target=_task, daemon=True).start()
+                _mark_module_done(self, key)
+        MODULE_EXECUTOR.submit(_task)
 
     def _precompute_all(self, log):
         _ensure_cache_dir()
@@ -4452,5 +4783,63 @@ def run_launcher():
     tk.Button(frame, text='一键更新数据', width=24, height=2, command=trigger_update_from_launcher, bg='#e8b830', fg='#1a1a2e').pack(pady=8)
     win.mainloop()
 
+
+def _run_module_cli(module_key):
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(SCRIPT_DIR)
+        module_map = {
+            "performance": ("收益表现", jijin_system.run_performance_score),
+            "risk": ("风险回撤", jijin_system.run_risk_drawdown),
+            "efficiency": ("风险效率", jijin_system.run_efficiency_score),
+            "position": ("位置估值", jijin_system.run_position_score),
+            "timing": ("趋势择时", jijin_system.run_timing_score),
+            "manager": ("基金经理", jijin_system.run_manager_score),
+            "cost": ("交易成本", jijin_system.run_cost_score),
+            "attribution": ("收益归因", jijin_system.run_attribution_score),
+            "composite": ("长期综合", jijin_system.run_composite_score),
+            "drawdown_shock": ("回撤震荡", jijin_system.run_drawdown_shock_screen),
+            "trend_breakout": ("趋势突破", jijin_system.run_trend_breakout_screen),
+            "low_vol_stable": ("低波稳健", jijin_system.run_low_vol_stable_screen),
+            "oversold_rebound": ("超跌反弹", jijin_system.run_oversold_rebound_screen),
+        }
+        if module_key.startswith("topic::"):
+            topic_name = module_key.split("::", 1)[1]
+            title = f"{topic_name}专题"
+            func = lambda log: jijin_system.run_topic_screen(topic_name, log)
+        else:
+            title, func = module_map.get(module_key, ("", None))
+        if not func:
+            print(f"未知模块：{module_key}", flush=True)
+            print("__RESULT_PATH__=", flush=True)
+            return 2
+
+        def _cli_log(message):
+            print(str(message), flush=True)
+
+        print(f"开始独立进程计算：{title}", flush=True)
+        path = func(_cli_log)
+        print(f"独立进程计算完成：{title}", flush=True)
+        print(f"__RESULT_PATH__={os.path.abspath(path) if path else ''}", flush=True)
+        return 0 if path else 1
+    except Exception as exc:
+        import traceback
+        print(f"模块计算异常：{exc}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        print("__RESULT_PATH__=", flush=True)
+        return 1
+    finally:
+        os.chdir(old_cwd)
+
+
 if __name__ == '__main__':
+    if "--build-fund-index" in sys.argv:
+        arg_index = sys.argv.index("--build-fund-index")
+        data_arg = sys.argv[arg_index + 1] if len(sys.argv) > arg_index + 1 else None
+        ok = _build_fund_index(data_arg, log=lambda msg: print(msg, flush=True))
+        sys.exit(0 if ok else 1)
+    if "--run-module" in sys.argv:
+        arg_index = sys.argv.index("--run-module")
+        module_arg = sys.argv[arg_index + 1] if len(sys.argv) > arg_index + 1 else ""
+        sys.exit(_run_module_cli(module_arg))
     run_fund_tools()

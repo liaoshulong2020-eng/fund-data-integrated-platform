@@ -18,6 +18,9 @@
 - 市场首页：全球主要指数、行业/概念资金流。
 - 我的持仓：导入持仓，计算市值、收益、今日收益。
 - 低内存计算：收益表现和风险回撤支持流式处理，减少大数据文件导致界面卡顿。
+- 本地索引：大体积基金 JSON 会生成 `fund_cache/fund_index.sqlite`，详情、走势、对比和持仓按基金代码快速读取。
+- 并发计算：模块按钮支持后台并发，重计算使用独立 Python 子进程，避免主界面被 CPU/GIL 拖住。
+- 窗口体验：结果窗口不强制置顶，不抢占其它应用焦点。
 
 ## 目录结构
 
@@ -31,7 +34,8 @@ fund-data-integrated-platform/
 ├── .gitignore              # 忽略本地数据、缓存、日志
 ├── docs/
 │   ├── ARCHITECTURE.md     # 系统结构说明
-│   └── DATA_WORKFLOW.md    # 数据爬取与迭代更新说明
+│   ├── DATA_WORKFLOW.md    # 数据爬取与迭代更新说明
+│   └── PROJECT_STATUS.md   # 当前工程状态和优化记录
 ├── data/                   # 运行后生成数据，不上传真实数据
 ├── outputs/                # 运行后生成 Excel/报告，不上传真实结果
 └── cache/                  # 运行后生成缓存，不上传真实缓存
@@ -97,6 +101,7 @@ python fund_platform.py
 - `fund_data/`：基金 JSON 数据。
 - `fund_excel/`：评分和筛选结果。
 - `fund_cache/`：模块缓存、资金流缓存。
+- `fund_cache/fund_index.sqlite`：本地基金详情索引，用于快速读取详情和走势。
 - `fund_visual_reports/`：历史报告。
 - `target_funds.json`：清洗后的基金池。
 
